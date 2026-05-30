@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Trash2, AlertTriangle } from 'lucide-react';
 import useTranslation, { savePhraseLocally } from '@/lib/useTranslation';
@@ -7,15 +7,21 @@ import AppHeader from '@/components/translator/AppHeader';
 import LanguageSelector from '@/components/translator/LanguageSelector';
 import ControlBar from '@/components/translator/ControlBar';
 import VoiceWaveform from '@/components/translator/VoiceWaveform';
-import StateBadge from '@/components/translator/StateBadge'; // Fixed! Updated from StatusIndicator
-import MessageBubble from '@/components/translator/MessageBubble'; // Fixed! Updated from ChatBubble
+import StateBadge from '@/components/translator/StateBadge'; // Gamit ang tamang pangalan mo
+import MessageBubble from '@/components/translator/MessageBubble'; // Gamit ang tamang pangalan mo
 import FloatingMicButton from '@/components/translator/FloatingMicButton';
 import TextInputBar from '@/components/translator/TextInputBar';
 import SubtitleMode from '@/components/translator/SubtitleMode';
 import EmergencyPhrases from '@/components/translator/EmergencyPhrases';
-import PhraseList from '@/components/translator/PhraseList'; // Fixed! Updated from SavedPhrases
+import PhraseList from '@/components/translator/PhraseList'; // Gamit ang tamang pangalan mo
 import HistoryPanel from '@/components/translator/HistoryPanel';
 import { toast } from 'sonner';
+import { preCacheEmergencyPhrases, getCacheSize } from '@/lib/offlineCache';
+
+// 🔥 FIREBASE & FIRESTORE IMPORTS
+import { auth, db } from '@/api/firebase'; 
+import { onAuthStateChanged } from 'firebase/auth';
+import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 
 export default function Home() {
   const {
@@ -30,6 +36,7 @@ export default function Home() {
     isListening,
     permissionState,
     isSpeechSupported,
+    audioLevel,
     setSourceLang,
     setTargetLang,
     setTone,
@@ -46,124 +53,343 @@ export default function Home() {
   const [savedOpen, setSavedOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [subtitleActive, setSubtitleActive] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const chatEndRef = useRef(null);
 
-  // Wire global error handler for speech errors
+  // 1. Firebase Auth Security Guard (Babalik sa login kapag walang user session)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setCurrentUser(user);
+      } else {
+        window.location.href = '/login';
+      }
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. FIRESTORE SYNC: Auto-save ng history logs sa cloud database kapag may bagong chat
+  useEffect(() => {
+    const saveLastMessageToFirestore = async () => {
+      if (!currentUser || messages.length === 0 || !isOnline) return;
+      
+      const lastMsg = messages[messages.length - 1];
+      
+      // Huwag i-save kung naitala na sa database
+      if (lastMsg.isSavedToFirestore) return;
+
+      try {
+        await addDoc(collection(db, 'translation_history'), {
+          userId: currentUser.uid,
+          text: lastMsg.text,
+          translatedText: lastMsg.translatedText,
+          sourceLang,
+          targetLang,
+          timestamp: serverTimestamp(),
+        });
+        lastMsg.isSavedToFirestore = true; 
+      } catch (error) {
+        console.error("Firestore history tracking block failure:", error);
+      }
+    };
+
+    saveLastMessageToFirestore();
+  }, [messages, currentUser, isOnline, sourceLang, targetLang]);
+
+  // 3. FIRESTORE SYNC: Pag-save ng Bookmarked phrases sa account ng user sa cloud
+  const handleSavePhrase = useCallback(async (message) => {
+    if (!currentUser) return;
+
+    // Pinapanatili ang local storage logic mo bilang offline backup
+    savePhraseLocally(message);
+
+    if (isOnline) {
+      try {
+        await addDoc(collection(db, 'saved_phrases'), {
+          userId: currentUser.uid,
+          text: message.text,
+          translatedText: message.translatedText,
+          sourceLang,
+          targetLang,
+          timestamp: serverTimestamp(),
+        });
+        toast.success('Phrase saved securely to cloud database!');
+      } catch (error) {
+        console.error("Firestore document write failure:", error);
+        toast.error('Failed to sync to cloud database.');
+      }
+    } else {
+      toast.success('Saved locally! Will sync once back online.');
+    }
+  }, [currentUser, isOnline, sourceLang, targetLang]);
+
+  // Global speech errors watcher
   useEffect(() => {
     window.__vtShowError = (msg) => toast.error(msg, { duration: 4000 });
     return () => { delete window.__vtShowError; };
   }, []);
 
-  // Automatically scroll to the latest translation bubble
+  // Offline caching para sa emergency phrases
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, interimDisplay]);
-
-  const handleSavePhrase = async (msg) => {
-    try {
-      await savePhraseLocally(msg);
-      toast.success('Phrase book updated!');
-    } catch (err) {
-      toast.error('Could not save phrase');
+    if (isOnline) {
+      preCacheEmergencyPhrases(targetLang);
     }
-  };
+  }, [isOnline, targetLang]);
+
+  // Net stats indicator alert toast
+  useEffect(() => {
+    if (!isOnline) {
+      toast.warning('You\'re offline. Cached translations are still available.', { duration: 4000 });
+    } else {
+      const size = getCacheSize();
+      if (size > 0) {
+        toast.success(`Back online! ${size} translations cached for offline use.`, { duration: 3000 });
+      }
+    }
+  }, [isOnline]);
+
+  // Auto-scroll anchor animation kapag may bagong bubble
+  useEffect(() => {
+    if (messages.length > 0) {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages]);
+
+  const handleMicToggle = useCallback(() => {
+    if (isListening) {
+      stopListening();
+    } else {
+      if (!isSpeechSupported) {
+        toast.error('Speech recognition is not supported in this browser. Please use Chrome or Edge.', { duration: 5000 });
+        return;
+      }
+      startListening();
+    }
+  }, [isListening, stopListening, startListening, isSpeechSupported]);
+
+  const handleSubtitleTranslate = useCallback(async (text) => {
+    return translateText(text);
+  }, [translateText]);
+
+  // Auth processing barrier
+  if (authLoading) {
+    return (
+      <div className="min-h-screen gradient-bg flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-sm text-muted-foreground font-medium">Loading user profile environment...</p>
+        </div>
+      </div>
+    );
+  }
+
+  const isProcessingOrSpeaking = status === 'translating' || status === 'processing' || status === 'speaking';
+  const showWaveform = isListening || isProcessingOrSpeaking;
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col relative overflow-hidden">
-      <AppHeader 
-        isDark={isDark} 
-        setIsDark={setIsDark} 
-        onOpenSaved={() => setSavedOpen(true)} 
-        onOpenHistory={() => setHistoryOpen(true)} 
-      />
+    <div className="min-h-screen gradient-bg flex flex-col w-full overflow-x-hidden">
+      {/* Decorative background blobs */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
+        <motion.div
+          className="absolute -top-40 -right-40 w-96 h-96 bg-primary/8 rounded-full blur-3xl"
+          animate={{ scale: [1, 1.1, 1] }}
+          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
+        />
+        <motion.div
+          className="absolute -bottom-40 -left-40 w-96 h-96 bg-accent/8 rounded-full blur-3xl"
+          animate={{ scale: [1, 1.08, 1] }}
+          transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+        />
+      </div>
 
-      <main className="flex-1 max-w-4xl w-full mx-auto p-4 flex flex-col gap-4 overflow-y-auto pb-32 scrollbar-hide">
-        <div className="flex justify-between items-center glass p-3 rounded-2xl">
-          <LanguageSelector 
-            sourceLang={sourceLang} 
-            targetLang={targetLang} 
-            onSourceChange={setSourceLang} 
-            onTargetChange={setTargetLang} 
-            onSwap={swapLanguages} 
-          />
-          <StateBadge status={isOnline ? 'online' : 'offline'} />
-        </div>
-
-        <ControlBar 
-          tone={tone} 
-          setTone={setTone} 
-          speechSpeed={speechSpeed} 
-          setSpeechSpeed={setSpeechSpeed} 
-          subtitleActive={subtitleActive}
-          setSubtitleActive={setSubtitleActive}
+      <div className="relative z-10 flex flex-col h-screen max-w-2xl mx-auto w-full px-2 sm:px-4">
+        {/* Header */}
+        <AppHeader
+          isDark={isDark}
+          onToggleDark={() => setIsDark(!isDark)}
+          isOnline={isOnline}
+          onOpenSaved={() => setSavedOpen(true)}
+          onOpenHistory={() => setHistoryOpen(true)}
+          user={currentUser}
         />
 
-        {permissionState === 'denied' && (
-          <div className="p-4 bg-destructive/10 border border-destructive/20 text-destructive rounded-xl flex items-center gap-3 text-sm">
-            <AlertTriangle className="h-5 w-5 shrink-0" />
-            <p>Microphone permission denied. Please allow mic access in your browser settings to translate voice.</p>
+        {/* Language Selector */}
+        <div className="w-full pb-2">
+          <LanguageSelector
+            sourceLang={sourceLang}
+            targetLang={targetLang}
+            onSourceChange={setSourceLang}
+            onTargetChange={setTargetLang}
+            onSwap={swapLanguages}
+          />
+        </div>
+
+        {/* Control Bar */}
+        <div className="w-full pb-2">
+          <ControlBar
+            tone={tone}
+            onToneChange={setTone}
+            speed={speechSpeed}
+            onSpeedChange={setSpeechSpeed}
+          />
+        </div>
+
+        {/* Offline Warning Banner */}
+        {!isOnline && (
+          <div className="w-full mb-2 px-3 py-2 rounded-xl bg-orange-500/10 border border-orange-400/20 flex items-center gap-2">
+            <span className="text-base">📵</span>
+            <div>
+              <p className="text-xs font-semibold text-orange-500">Offline Mode</p>
+              <p className="text-xs text-orange-400/80">Cached data active. Cloud synchronization paused.</p>
+            </div>
           </div>
         )}
 
-        <div className="flex-1 min-h-[300px] glass-strong rounded-3xl p-4 flex flex-col overflow-hidden relative">
-          <div className="flex-1 overflow-y-auto space-y-4 pr-1 scrollbar-hide">
-            {messages.length === 0 && !interimDisplay && (
-              <div className="h-full flex items-center justify-center text-center text-muted-foreground p-8">
-                <p>Tap the microphone or type below to start translating sentences in real-time.</p>
-              </div>
-            )}
+        {/* Browser Voice Recognition Warning */}
+        {!isSpeechSupported && (
+          <div className="w-full mb-2 px-3 py-2 rounded-xl bg-orange-500/10 border border-orange-400/20 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-orange-400 flex-shrink-0" />
+            <p className="text-xs text-orange-400">
+              Voice input requires Chrome or Edge. Text input is still available.
+            </p>
+          </div>
+        )}
 
-            {messages.map((msg) => (
-              <MessageBubble 
-                key={msg.id} 
-                message={msg} 
-                onSave={() => handleSavePhrase(msg)}
-                onSpeak={() => speak(msg.translated_text, targetLang)} 
-              />
-            ))}
+        {/* Mic Permission Warning */}
+        {permissionState === 'denied' && (
+          <div className="w-full mb-2 px-3 py-2 rounded-xl bg-destructive/10 border border-destructive/20 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-destructive flex-shrink-0" />
+            <p className="text-xs text-destructive">
+              Microphone access denied. Enable it in your browser settings.
+            </p>
+          </div>
+        )}
 
-            {interimDisplay && (
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-start">
-                <div className="bg-muted/40 text-muted-foreground p-3 rounded-2xl max-w-[80%] italic animate-pulse">
-                  {interimDisplay}...
+        {/* Main Chat / Feed Area */}
+        <div className="flex-1 overflow-y-auto w-full py-2 space-y-3 scrollbar-hide">
+          <AnimatePresence initial={false}>
+            {messages.length === 0 ? (
+              <motion.div
+                key="empty"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                className="flex flex-col items-center justify-center h-full text-center px-4 min-h-[250px]"
+              >
+                <div className="space-y-4 w-full max-w-md">
+                  <motion.div 
+                    className="w-20 h-20 rounded-3xl gradient-primary flex items-center justify-center mx-auto shadow-xl shadow-primary/20"
+                    initial={{ opacity: 0, scale: 0.85 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ duration: 0.4 }}
+                  >
+                    <span className="text-white font-black text-4xl">V</span>
+                  </motion.div>
+                  
+                  <div>
+                    <h2 className="text-xl font-bold tracking-tight">VoiceTranslate</h2>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mt-1">Cloud Protected Database</p>
+                    <p className="text-sm text-muted-foreground mt-3 max-w-xs mx-auto">
+                      Tap the mic to speak or type below. Translations appear instantly and sync securely.
+                    </p>
+                  </div>
+                  <EmergencyPhrases onTranslate={translateText} onSpeak={speak} />
                 </div>
               </motion.div>
+            ) : (
+              <>
+                {messages.map(msg => (
+                  <MessageBubble
+                    key={msg.id}
+                    message={msg}
+                    onSpeak={speak}
+                    onSave={handleSavePhrase}
+                  />
+                ))}
+                <div ref={chatEndRef} className="h-1" />
+              </>
             )}
-            <div ref={chatEndRef} />
-          </div>
-
-          {messages.length > 0 && (
-            <button 
-              onClick={clearMessages} 
-              className="absolute top-4 right-4 p-2 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-xl transition-colors"
-              title="Clear transcription history"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          )}
+          </AnimatePresence>
         </div>
 
-        {subtitleActive && <SubtitleMode text={interimDisplay || (messages[messages.length - 1]?.translated_text)} />}
-        <EmergencyPhrases onSelect={(text) => translateText(text)} />
-      </main>
+        {/* Audio Waveform Feedback Indicator */}
+        <div className="w-full min-h-[70px] flex flex-col items-center justify-center bg-transparent">
+          <AnimatePresence>
+            {showWaveform && (
+              <motion.div
+                key="waveform"
+                initial={{ opacity: 0, scaleY: 0.4 }}
+                animate={{ opacity: 1, scaleY: 1 }}
+                exit={{ opacity: 0, scaleY: 0.4 }}
+                className="w-full"
+              >
+                <VoiceWaveform isActive={isListening} status={status} audioLevel={audioLevel} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          <StateBadge status={status} interimText={interimDisplay} />
+        </div>
 
-      <div className="fixed bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-background via-background/95 to-transparent z-20">
-        <div className="max-w-4xl w-full mx-auto flex items-center gap-3">
-          <TextInputBar onSend={(text) => translateText(text)} disabled={isListening} />
-          <FloatingMicButton 
-            isListening={isListening} 
-            onStart={startListening} 
-            onStop={stopListening} 
+        {/* Operational Footer Controls */}
+        <div className="w-full pb-6 pt-1 space-y-3 bg-transparent">
+          <TextInputBar
+            onSend={translateText}
+            disabled={isListening || status === 'translating' || status === 'processing'}
           />
+
+          <div className="flex items-center justify-center gap-6 pt-1">
+            <SubtitleMode
+              sourceLang={sourceLang}
+              onTranslate={handleSubtitleTranslate}
+              isActive={subtitleActive}
+              onToggle={() => setSubtitleActive(p => !p)}
+            />
+
+            <FloatingMicButton
+              isListening={isListening}
+              onToggle={handleMicToggle}
+              disabled={!isSpeechSupported}
+              permissionDenied={permissionState === 'denied'}
+              status={status}
+              audioLevel={audioLevel}
+            />
+
+            <div className="w-10 h-10 flex items-center justify-center">
+              <AnimatePresence>
+                {messages.length > 0 && (
+                  <motion.button
+                    key="clear"
+                    initial={{ opacity: 0, scale: 0.7 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.7 }}
+                    onClick={clearMessages}
+                    className="p-2.5 rounded-lg glass hover:bg-secondary/80 transition-colors flex items-center justify-center"
+                    title="Clear chat"
+                  >
+                    <Trash2 className="w-5 h-5 text-muted-foreground" />
+                  </motion.button>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
         </div>
       </div>
 
-      {isListening && <VoiceWaveform />}
-
-      <AnimatePresence>
-        {savedOpen && <PhraseList onClose={() => setSavedOpen(false)} />}
-        {historyOpen && <HistoryPanel onClose={() => setHistoryOpen(false)} />}
-      </AnimatePresence>
+      {/* Floating Application Modals */}
+      <PhraseList
+        open={savedOpen}
+        onClose={() => setSavedOpen(false)}
+        onSpeak={speak}
+        userId={currentUser?.uid} 
+      />
+      <HistoryPanel
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        onSpeak={speak}
+        userId={currentUser?.uid}
+      />
     </div>
   );
 }

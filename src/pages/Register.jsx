@@ -5,7 +5,7 @@ import { Mail, Lock, Loader2, Eye, EyeOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { createUserWithEmailAndPassword, signInWithPopup } from 'firebase/auth';
-import { auth, googleProvider, githubProvider } from '@/api/firebase'; // Naka-target sa bago mong firebase.js file
+import { auth, googleProvider } from '@/api/firebase'; // Naka-target sa bago mong firebase.js file
 
 export default function Register() {
   const [email, setEmail] = useState('');
@@ -65,22 +65,6 @@ export default function Register() {
     }
   };
 
-  const handleGithub = async () => {
-    setError('');
-    setLoading(true);
-    try {
-      await signInWithPopup(auth, githubProvider);
-      window.location.href = '/';
-    } catch (err) {
-      console.error('GitHub registration failure tracker:', err);
-      if (err.code !== 'auth/popup-closed-by-user') {
-        setError('Hindi nagtagumpay ang pag-verify sa iyong GitHub account configuration layer.');
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div className="min-h-screen gradient-bg flex items-center justify-center p-4 relative overflow-hidden">
       <div className="absolute -top-40 -right-40 w-80 h-80 bg-primary/10 rounded-full blur-3xl" />
@@ -103,9 +87,6 @@ export default function Register() {
           <div className="space-y-2">
             <Button variant="outline" className="w-full" onClick={handleGoogle} disabled={loading}>
               Sign up with Google
-            </Button>
-            <Button variant="outline" className="w-full" onClick={handleGithub} disabled={loading}>
-              Sign up with GitHub
             </Button>
           </div>
 

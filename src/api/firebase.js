@@ -2,10 +2,10 @@ import { initializeApp } from "firebase/app";
 import {
   getAuth,
   GoogleAuthProvider,
-  GithubAuthProvider,
   signInWithPopup,
   signOut,
 } from "firebase/auth";
+import { getFirestore } from "firebase/firestore"; // Idinagdag para sa database
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -16,18 +16,19 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
+// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
+// I-export ang Auth at Firestore Database
 export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
-export const githubProvider = new GithubAuthProvider();
+export const db = getFirestore(app); // Gagamitin natin ito para sa history saving
 
+// Google Auth Provider setup
+export const googleProvider = new GoogleAuthProvider();
+
+// Google Sign-In Function
 export async function signInWithGoogle() {
   return signInWithPopup(auth, googleProvider);
-}
-
-export async function signInWithGithub() {
-  return signInWithPopup(auth, githubProvider);
 }
 
 export function logout() {
